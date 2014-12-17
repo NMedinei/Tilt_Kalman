@@ -1,28 +1,151 @@
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+#include <Wire.h>
+#include "ADXL.h"
+#include "ITG.h"
 
-# Precompiled Headers
-*.gch
-*.pch
+#define ITG3200_CONVERSION  14.375 // LSB/(deg/sec)
+#define SYNC_T 10        // Main loop cycle time in ms
+#define PWM_INT_DIV 5   // Times the PWM position should be updated per loop 
+#define PWM_RESOLUTION  12
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
+#define AXIS_DWN(x,y,z)   ((double)(x))
+#define AXIS_FWD(x,y,z)   ((double)((z))) 
+#define AXIS_LFT(x,y,z)   ((double)((y)))
 
-# Fortran module files
-*.mod
+ADXL adxl;
+ITG  itg;
 
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
+int acc_data[3];
+int gyro_data[3];
 
-# Executables
-*.exe
-*.out
-*.app
+static double avg_fwd=0, avg_side=0;
+
+char c;
+double dt = 0.01;
+double gyro_angle = 0;
+double gyro_bias = 0;
+double P_00 = 0, P_01 = 0, P_10 = 0, P_11 = 0;
+double y, S;
+double K_0, K_1;
+
+double Q_angle  =  0.001; //0.001
+double Q_gyro   =  0.003;  //0.003
+double R_angle  =  0.03;  //0.03
+
+// These valuse have to be changed completely. Whather based on the data sheet, or
+// empirical results from the sensors, themselves.
+
+static volatile uint16_t sync_cnt = 0;
+volatile uint8_t sync;
+
+ISR(TIMER5_COMPA_vect)          // timer compare interrupt service routine
+{
+	
+	if (sync_cnt == (PWM_INT_DIV - 1))
+	{
+		sync_cnt = 0;
+                  
+		sync = 1;
+	}	
+	else
+		sync_cnt ++;
+}
+
+void setupTimer(){
+	// initialize timer5
+	noInterrupts();           // disable all interrupts
+	TCCR5A = 0;
+	TCCR5B = 0;
+	TCNT5  = 0;
+
+	OCR5A = (250 * SYNC_T / PWM_INT_DIV);            // compare match register 16MHz/256/2Hz
+	TCCR5B |= (1 << WGM12);   // CTC mode
+	TCCR5B |= (1 << CS10) | (1<<CS11);    // 64 prescaler 
+	TIMSK5 |= (1 << OCIE1A);  // enable timer compare interrupt
+        
+        interrupts();
+}
+
+uint8_t waitSync()
+{
+	while (!sync);
+	sync = 0;
+}
+
+
+void setup() {
+  
+  Wire.begin();
+  setupTimer();
+  
+  Serial.begin(115200);
+  
+  itg.init();
+  
+  adxl.accel_setup();
+  
+}
+
+
+int temp = 0;
+int second_temp = 0;
+char a = 0;
+double b = 0;
+
+void loop() {
+
+   static double Accel_angle = 0;
+   static double Accel_angle_ave = 0;
+   static double average = 0;
+   static double Q_ave = 0;
+   static double Q_ave_final = 0;
+   static double fwd_angle_est;
+   static double fwd_average;
+    
+   adxl.readAccel(acc_data);
+   Accel_angle = read_Acc_angle();  // in degrees
+
+   itg.readXYZ(gyro_data);
+
+   fwd_angle_est = kalmanCalculate(Accel_angle, (gyro_data[1] / ITG3200_CONVERSION));
+  
+   Serial.print(fwd_angle_est);
+
+
+   waitSync();
+}
+
+double read_Acc_angle(){
+  
+  double fwd_angle;
+  
+  fwd_angle = (double)(atan2(acc_data[0] , acc_data[2] ));
+  fwd_angle = fwd_angle*180/PI;
+
+  avg_fwd = (avg_fwd * 9 + fwd_angle) / 10;
+  
+  return avg_fwd;
+}
+
+
+float kalmanCalculate(float Accel_angle, float gyroRate) {
+
+    gyro_angle += dt * (gyroRate - gyro_bias);
+    P_00 +=  - dt * (P_10 + P_01) + Q_angle * dt;
+    P_01 +=  - dt * P_11;
+    P_10 +=  - dt * P_11;
+    P_11 +=  + Q_gyro * dt;
+
+    y = Accel_angle - gyro_angle;
+    S = P_00 + R_angle;
+    K_0 = P_00 / S;
+    K_1 = P_10 / S;
+
+    gyro_angle +=  K_0 * y;
+    gyro_bias  +=  K_1 * y;
+    P_00 -= K_0 * P_00;
+    P_01 -= K_0 * P_01;
+    P_10 -= K_1 * P_00;
+    P_11 -= K_1 * P_01;
+
+    return gyro_angle;
+}
